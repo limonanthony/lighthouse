@@ -236,6 +236,68 @@ func (rm *RelayManager) SubscribeTrustedTorrents(ctx context.Context, pubkeys []
 	return rm.SubscribeAll(ctx, filters, handler)
 }
 
+// FetchAllHistoricalTorrents fetches the complete history of torrent events from trusted authors
+// by paginating through all pages using the Until filter (newest-first, decreasing Until per page).
+// This bypasses the relay's per-subscription event limit (typically 500).
+func (rm *RelayManager) FetchAllHistoricalTorrents(ctx context.Context, pubkeys []string, handler func(*nostr.Event, string)) error {
+	if len(pubkeys) == 0 {
+		return errors.New("no pubkeys provided")
+	}
+
+	clients := rm.GetConnectedClients()
+	if len(clients) == 0 {
+		return errors.New("no connected relays")
+	}
+
+	const pageSize = 500
+
+	for _, client := range clients {
+		url := client.URL()
+		log.Info().Str("relay", url).Msg("Fetching full historical torrents (paginated)")
+
+		var until *nostr.Timestamp
+		totalFetched := 0
+		page := 0
+
+		for {
+			filter := nostr.Filter{
+				Kinds:   []int{KindTorrent},
+				Authors: pubkeys,
+				Limit:   pageSize,
+			}
+			if until != nil {
+				filter.Until = until
+			}
+
+			events, err := client.QueryEvents(ctx, []nostr.Filter{filter})
+			if err != nil {
+				log.Error().Err(err).Str("relay", url).Int("page", page).Msg("Failed to query historical events")
+				break
+			}
+
+			if len(events) == 0 {
+				break
+			}
+
+			for _, event := range events {
+				handler(event, url)
+			}
+
+			totalFetched += len(events)
+			page++
+			log.Info().Str("relay", url).Int("page", page).Int("batch", len(events)).Int("total", totalFetched).Msg("Historical page fetched")
+
+			// Advance Until to just before the oldest event in this batch
+			oldest := events[len(events)-1].CreatedAt - 1
+			until = &oldest
+		}
+
+		log.Info().Str("relay", url).Int("total", totalFetched).Msg("Historical fetch complete")
+	}
+
+	return nil
+}
+
 // FetchContactList fetches contact list from any connected relay
 func (rm *RelayManager) FetchContactList(ctx context.Context, pubkey string) (*nostr.Event, error) {
 	clients := rm.GetConnectedClients()

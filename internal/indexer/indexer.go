@@ -92,7 +92,17 @@ func (idx *Indexer) Start(ctx context.Context) error {
 
 	log.Info().Int("trusted_uploaders", len(trustedPubkeys)).Msg("Subscribing to trusted uploaders")
 
-	// Subscribe to torrent events from trusted uploaders only
+	// Fetch full history via paginated queries (bypasses relay's per-subscription limit)
+	go func() {
+		log.Info().Msg("Starting paginated historical fetch")
+		if err := idx.relayManager.FetchAllHistoricalTorrents(idx.ctx, trustedPubkeys, func(event *gonostr.Event, relayURL string) {
+			idx.processEvent(event, relayURL)
+		}); err != nil {
+			log.Error().Err(err).Msg("Historical fetch failed")
+		}
+	}()
+
+	// Subscribe to torrent events from trusted uploaders only (real-time + latest batch)
 	err = idx.relayManager.SubscribeTrustedTorrents(idx.ctx, trustedPubkeys, func(event *gonostr.Event, relayURL string) {
 		idx.processEvent(event, relayURL)
 	})
