@@ -43,6 +43,11 @@ func Init(dbPath string) error {
 		return fmt.Errorf("failed to ping database: %w", err)
 	}
 
+	// Performance PRAGMAs for large databases
+	db.Exec("PRAGMA cache_size = -65536")       // 64MB cache (default is 2MB)
+	db.Exec("PRAGMA mmap_size = 268435456")      // 256MB memory-mapped I/O
+	db.Exec("PRAGMA temp_store = MEMORY")        // Temp tables in memory
+
 	// Run schema
 	if err := runSchema(); err != nil {
 		return fmt.Errorf("failed to run schema: %w", err)
@@ -306,6 +311,16 @@ func GetTorrentsPerDay(days int) ([]map[string]interface{}, error) {
 	}
 
 	return stats, nil
+}
+
+// GetLatestEventTimestamp returns the unix timestamp of the most recently uploaded event.
+// Used to resume historical fetch from where we left off.
+func GetLatestEventTimestamp() (int64, error) {
+	var ts int64
+	err := db.QueryRow(`
+		SELECT COALESCE(MAX(strftime('%s', uploaded_at)), 0) FROM torrent_uploads
+	`).Scan(&ts)
+	return ts, err
 }
 
 // LogActivity logs an activity event
