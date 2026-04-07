@@ -329,6 +329,62 @@ func GetLatestEventTimestamp() (int64, error) {
 	return ts, err
 }
 
+// RelayBackfillProgress tracks how far backwards we've paginated history
+// for a single relay, so that resync can resume across restarts.
+type RelayBackfillProgress struct {
+	RelayURL        string
+	OldestFetchedAt int64
+	NewestFetchedAt int64
+	Completed       bool
+}
+
+// GetRelayBackfillProgress returns the checkpoint row for a relay. If no row
+// exists yet, it returns a zero-value struct (OldestFetchedAt == 0) and nil
+// error — callers should treat that as "start from now".
+func GetRelayBackfillProgress(relayURL string) (RelayBackfillProgress, error) {
+	var p RelayBackfillProgress
+	p.RelayURL = relayURL
+	var completed int
+	err := db.QueryRow(`
+		SELECT oldest_fetched_at, newest_fetched_at, completed
+		FROM relay_backfill_progress
+		WHERE relay_url = ?
+	`, relayURL).Scan(&p.OldestFetchedAt, &p.NewestFetchedAt, &completed)
+	if err == sql.ErrNoRows {
+		return p, nil
+	}
+	if err != nil {
+		return p, err
+	}
+	p.Completed = completed != 0
+	return p, nil
+}
+
+// UpdateRelayBackfillProgress upserts the checkpoint for a relay. The newest
+// and oldest watermarks are merged with any existing row so a resync that
+// only walks backwards doesn't clobber the newest watermark recorded earlier.
+func UpdateRelayBackfillProgress(relayURL string, oldest, newest int64, completed bool) error {
+	completedInt := 0
+	if completed {
+		completedInt = 1
+	}
+	_, err := db.Exec(`
+		INSERT INTO relay_backfill_progress
+			(relay_url, oldest_fetched_at, newest_fetched_at, completed, last_updated_at)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(relay_url) DO UPDATE SET
+			oldest_fetched_at = CASE
+				WHEN relay_backfill_progress.oldest_fetched_at = 0 THEN excluded.oldest_fetched_at
+				WHEN excluded.oldest_fetched_at = 0 THEN relay_backfill_progress.oldest_fetched_at
+				ELSE MIN(relay_backfill_progress.oldest_fetched_at, excluded.oldest_fetched_at)
+			END,
+			newest_fetched_at = MAX(relay_backfill_progress.newest_fetched_at, excluded.newest_fetched_at),
+			completed = excluded.completed,
+			last_updated_at = CURRENT_TIMESTAMP
+	`, relayURL, oldest, newest, completedInt)
+	return err
+}
+
 // LogActivity logs an activity event
 func LogActivity(eventType string, details string) error {
 	_, err := db.Exec(`

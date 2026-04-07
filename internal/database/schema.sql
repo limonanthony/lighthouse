@@ -290,6 +290,22 @@ CREATE TABLE IF NOT EXISTS relay_events (
 );
 
 -- =====================================================
+-- RELAY BACKFILL PROGRESS
+-- =====================================================
+
+-- Per-relay historical backfill checkpoint. Lets the resync walker resume
+-- backwards pagination across container restarts instead of starting over.
+-- oldest_fetched_at is the unix timestamp of the oldest event we've pulled
+-- from this relay so far; the next backfill page starts with Until = that.
+CREATE TABLE IF NOT EXISTS relay_backfill_progress (
+    relay_url           TEXT PRIMARY KEY,
+    oldest_fetched_at   INTEGER NOT NULL DEFAULT 0,
+    newest_fetched_at   INTEGER NOT NULL DEFAULT 0,
+    completed           INTEGER NOT NULL DEFAULT 0,
+    last_updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- =====================================================
 -- ACTIVITY LOG
 -- =====================================================
 

@@ -421,7 +421,15 @@ func (idx *Indexer) enrichPendingTorrents() {
 	}
 }
 
-// FetchHistorical fetches historical torrents from relays
+// FetchHistorical fetches historical torrents from relays by walking each
+// connected relay backwards with bounded pagination. Per-relay checkpoints in
+// the relay_backfill_progress table let this resume across restarts.
+//
+// days == 0 means "no time limit" (walk until each relay reports an empty
+// page). days > 0 stops the walk when it crosses the (now - days) floor.
+//
+// If no relays are currently connected, falls back to the legacy single-REQ
+// SubscribeTrustedTorrents path so the caller still gets *something*.
 func (idx *Indexer) FetchHistorical(days int) error {
 	if !idx.IsRunning() {
 		return nil
@@ -449,16 +457,48 @@ func (idx *Indexer) FetchHistorical(days int) error {
 		trustedPubkeys = append(trustedPubkeys, pubkey)
 	}
 
-	if days == 0 {
-		log.Info().Int("uploaders", len(trustedPubkeys)).Msg("Fetching all historical torrents from trusted uploaders")
-	} else {
-		log.Info().Int("days", days).Int("uploaders", len(trustedPubkeys)).Msg("Fetching historical torrents from trusted uploaders")
+	var sinceFloor int64
+	if days > 0 {
+		sinceFloor = time.Now().Add(-time.Duration(days) * 24 * time.Hour).Unix()
 	}
 
-	// Re-subscribe to get fresh data from trusted uploaders
-	return idx.relayManager.SubscribeTrustedTorrents(idx.ctx, trustedPubkeys, func(event *gonostr.Event, relayURL string) {
-		idx.processEvent(event, relayURL)
-	})
+	if days == 0 {
+		log.Info().Int("uploaders", len(trustedPubkeys)).Msg("Backfilling all historical torrents from trusted uploaders")
+	} else {
+		log.Info().Int("days", days).Int64("since_floor", sinceFloor).Int("uploaders", len(trustedPubkeys)).Msg("Backfilling historical torrents from trusted uploaders")
+	}
+
+	clients := idx.relayManager.GetConnectedClients()
+	if len(clients) == 0 {
+		log.Warn().Msg("No connected relays for backfill, falling back to live subscribe")
+		return idx.relayManager.SubscribeTrustedTorrents(idx.ctx, trustedPubkeys, func(event *gonostr.Event, relayURL string) {
+			idx.processEvent(event, relayURL)
+		})
+	}
+
+	// Bounded per-relay parallelism. 4 concurrent relay walkers is enough to
+	// hide latency without hammering each relay.
+	const maxParallel = 4
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+
+	for _, c := range clients {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(client *nostr.Client) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if _, err := idx.relayManager.BackfillRelay(idx.ctx, client, trustedPubkeys, sinceFloor, func(event *gonostr.Event, relayURL string) {
+				idx.processEvent(event, relayURL)
+			}); err != nil {
+				log.Error().Err(err).Str("relay", client.URL()).Msg("Backfill failed for relay")
+			}
+		}(c)
+	}
+	wg.Wait()
+
+	log.Info().Int("relays", len(clients)).Msg("Backfill walk complete across all relays")
+	return nil
 }
 
 // ImportContactList imports follows from a contact list

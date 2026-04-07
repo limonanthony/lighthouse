@@ -313,6 +313,177 @@ func (rm *RelayManager) FetchAllHistoricalTorrents(ctx context.Context, pubkeys 
 	return nil
 }
 
+// BackfillRelay performs bounded backwards pagination for kind 2003 events from
+// a single relay, resuming from a per-relay checkpoint if one exists. It is the
+// resync-friendly cousin of FetchAllHistoricalTorrents: pages backwards using
+// the Until cursor, persists progress per page so a container restart can pick
+// up where it left off, and stops when the relay reports an empty page (marks
+// completed=true) or when Until crosses the configured floor.
+//
+// sinceFloor is the unix timestamp lower bound (events older than this are not
+// fetched). Pass 0 for "no limit".
+//
+// Returns the number of events fetched from this relay.
+func (rm *RelayManager) BackfillRelay(ctx context.Context, client *Client, pubkeys []string, sinceFloor int64, handler func(*nostr.Event, string)) (int, error) {
+	if len(pubkeys) == 0 {
+		return 0, errors.New("no pubkeys provided")
+	}
+	if client == nil {
+		return 0, errors.New("nil relay client")
+	}
+
+	// Page size chosen to be friendly to relays that cap REQ responses low
+	// (e.g. U2P relays cap at 100/sub). 200 is a small over-fetch on those
+	// and a fine page size on permissive relays.
+	const pageSize = 200
+
+	url := client.URL()
+
+	// Resume from checkpoint if present.
+	progress, err := database.GetRelayBackfillProgress(url)
+	if err != nil {
+		log.Warn().Err(err).Str("relay", url).Msg("Failed to load backfill checkpoint, starting fresh")
+		progress = database.RelayBackfillProgress{RelayURL: url}
+	}
+
+	// Decide where to start the backwards walk.
+	// - If we have a previous oldest watermark, resume from just before it.
+	// - Otherwise, start from now.
+	now := time.Now().Unix()
+	startUntil := now
+	if progress.OldestFetchedAt > 0 {
+		startUntil = progress.OldestFetchedAt
+	}
+
+	var since *nostr.Timestamp
+	if sinceFloor > 0 {
+		s := nostr.Timestamp(sinceFloor)
+		since = &s
+	}
+
+	untilTs := nostr.Timestamp(startUntil)
+	until := &untilTs
+
+	// Track watermarks to persist back to the checkpoint table.
+	oldestSeen := progress.OldestFetchedAt
+	newestSeen := progress.NewestFetchedAt
+
+	totalFetched := 0
+	page := 0
+
+	log.Info().
+		Str("relay", url).
+		Int64("start_until", startUntil).
+		Int64("since_floor", sinceFloor).
+		Bool("resumed", progress.OldestFetchedAt > 0).
+		Msg("Starting backfill walk")
+
+	for {
+		// Honor cancellation between pages.
+		select {
+		case <-ctx.Done():
+			log.Info().Str("relay", url).Int("total", totalFetched).Msg("Backfill canceled")
+			return totalFetched, ctx.Err()
+		default:
+		}
+
+		filter := nostr.Filter{
+			Kinds:   []int{KindTorrent},
+			Authors: pubkeys,
+			Limit:   pageSize,
+			Until:   until,
+		}
+		if since != nil {
+			filter.Since = since
+		}
+
+		events, err := client.QueryEvents(ctx, []nostr.Filter{filter})
+		if err != nil {
+			log.Error().Err(err).Str("relay", url).Int("page", page).Msg("Backfill page query failed")
+			// Persist what we have so far before bailing out.
+			_ = database.UpdateRelayBackfillProgress(url, oldestSeen, newestSeen, false)
+			return totalFetched, err
+		}
+
+		if len(events) == 0 {
+			// Relay is out of history within (sinceFloor, until]. We're done.
+			completed := sinceFloor == 0
+			if err := database.UpdateRelayBackfillProgress(url, oldestSeen, newestSeen, completed); err != nil {
+				log.Warn().Err(err).Str("relay", url).Msg("Failed to persist backfill checkpoint")
+			}
+			log.Info().
+				Str("relay", url).
+				Int("total", totalFetched).
+				Bool("completed", completed).
+				Msg("Backfill walk finished (empty page)")
+			return totalFetched, nil
+		}
+
+		// Hand events off to the indexer pipeline and update watermarks.
+		var batchOldest, batchNewest int64
+		for i, event := range events {
+			ts := int64(event.CreatedAt)
+			if i == 0 {
+				batchOldest = ts
+				batchNewest = ts
+			} else {
+				if ts < batchOldest {
+					batchOldest = ts
+				}
+				if ts > batchNewest {
+					batchNewest = ts
+				}
+			}
+			handler(event, url)
+		}
+
+		if oldestSeen == 0 || batchOldest < oldestSeen {
+			oldestSeen = batchOldest
+		}
+		if batchNewest > newestSeen {
+			newestSeen = batchNewest
+		}
+
+		totalFetched += len(events)
+		page++
+
+		log.Info().
+			Str("relay", url).
+			Int("page", page).
+			Int("batch", len(events)).
+			Int("total", totalFetched).
+			Int64("batch_oldest", batchOldest).
+			Msg("Backfill page fetched")
+
+		// Persist progress every page so a crash mid-walk is recoverable.
+		if err := database.UpdateRelayBackfillProgress(url, oldestSeen, newestSeen, false); err != nil {
+			log.Warn().Err(err).Str("relay", url).Msg("Failed to persist backfill checkpoint")
+		}
+
+		// Advance Until to the oldest event's timestamp. The deduplicator
+		// handles overlap on same-second events.
+		nextUntil := nostr.Timestamp(batchOldest)
+		if until != nil && nextUntil == *until {
+			// Same timestamp as last page — we've exhausted this second.
+			nextUntil--
+		}
+
+		// Stop if we've crossed the configured floor.
+		if sinceFloor > 0 && int64(nextUntil) < sinceFloor {
+			log.Info().
+				Str("relay", url).
+				Int("total", totalFetched).
+				Int64("since_floor", sinceFloor).
+				Msg("Backfill walk reached time-range floor")
+			// Not "completed" in the absolute sense — there may be older
+			// events past the floor — so leave completed=false.
+			return totalFetched, nil
+		}
+
+		until = &nextUntil
+	}
+}
+
 // FetchContactList fetches contact list from any connected relay
 func (rm *RelayManager) FetchContactList(ctx context.Context, pubkey string) (*nostr.Event, error) {
 	clients := rm.GetConnectedClients()
